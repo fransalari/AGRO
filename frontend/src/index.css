@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+:root {
+  --agro-green: #1b5e20;
+  --agro-green-mid: #2e7d32;
+  --agro-amber: #c47b00;
+  --agro-soil: #5d4037;
+  --agro-sky: #e8f0e9;
+  --agro-ink: #1a2420;
+  --agro-panel: rgba(255, 255, 255, 0.92);
+  font-family: "Segoe UI", "Candara", "Calibri", system-ui, sans-serif;
+  color: var(--agro-ink);
+  background: #0f1a14;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(46, 125, 50, 0.35), transparent 50%),
+    radial-gradient(ellipse at 90% 10%, rgba(196, 123, 0, 0.18), transparent 40%),
+    linear-gradient(160deg, #0f1a14 0%, #163022 45%, #0f1a14 100%);
+  color: #eef5ef;
+}
+
+button {
+  font: inherit;
+}
+
+.maplibregl-map {
+  font: inherit;
+}

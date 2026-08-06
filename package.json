@@ -1,0 +1,11 @@
+{
+  "name": "agro-muestreo-dirigido",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Plataforma web para muestreo dirigido e interpolación de daños en lotes agrícolas — Sancor Seguros",
+  "scripts": {
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "backend\\.venv\\Scripts\\uvicorn app.main:app --reload --app-dir backend --port 8000",
+    "build:index": "backend\\.venv\\Scripts\\python backend\\scripts\\build_index.py"
+  }
+}
