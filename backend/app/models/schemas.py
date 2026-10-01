@@ -33,15 +33,46 @@ class ZoneParams(BaseModel):
     symbology: Literal["continuous", "discrete"] = "discrete"
 
 
+class ClusterContribution(BaseModel):
+    cluster: int
+    label: str
+    n_cells: int
+    area_ha: float
+    weight: float
+    weight_pct: float
+    damage: float
+    contribution: float
+    contribution_pct: float
+
+
 class CompareResult(BaseModel):
+    """traditional_mean = promedio simple de muestras;
+    weighted_mean = ponderado por área de clusters K-Means (k);
+    weighted_ambientes_mean = re-KMeans por similitud de daño → menos ambientes;
+    directed_mean = media del raster IDW (referencia espacial continua).
+    """
+
     traditional_mean: float
+    weighted_mean: float
+    weighted_ambientes_mean: float = 0.0
     directed_mean: float
     abs_diff: float
     pct_diff: float
+    abs_diff_ambientes: float = 0.0
+    pct_diff_ambientes: float = 0.0
+    abs_diff_k_vs_ambientes: float = 0.0
+    pct_diff_k_vs_ambientes: float = 0.0
+    abs_diff_idw: float = 0.0
+    pct_diff_idw: float = 0.0
     n_samples: int
     k: int
+    k_ambientes: int = 0
     area_ha: float
     grid_res_m: float
+    clusters: list[ClusterContribution] = Field(default_factory=list)
+    ambientes: list[ClusterContribution] = Field(default_factory=list)
+    cluster_to_ambiente: dict[int, int] = Field(default_factory=dict)
+    ambientes_silhouette: float | None = None
 
 
 class SessionState(BaseModel):

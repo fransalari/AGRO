@@ -31,52 +31,124 @@ def _safe_float(v: Any) -> float | None:
 
 
 def load_claims_dataframe(path: Path | None = None) -> pd.DataFrame:
+    """
+    Load claim samples.
+
+    Hierarchy: siniestro → orden de trabajo → lote → muestras.
+    If several work orders touch the same lot, only the first WO is kept
+    (earliest assigned/event date, then lowest workOrderId). That filter is
+    applied after spatial join in build_or_load_index; here we normalize fields.
+    """
     path = path or settings.claims_path
     df = pd.read_csv(path, sep=";", low_memory=False)
 
-    lat = pd.to_numeric(df.get("ros_lat_muestra"), errors="coerce")
-    if lat.isna().all():
-        lat = pd.to_numeric(df.get("gpsPointSampleX"), errors="coerce")
-    lon = pd.to_numeric(df.get("ros_lon_muestra"), errors="coerce")
-    if lon.isna().all():
-        lon = pd.to_numeric(df.get("gpsPointSampleY"), errors="coerce")
+    lat = _numeric_col(df, ["ros_lat_muestra", "gpsPointSampleX"])
+    lon = _numeric_col(df, ["ros_lon_muestra", "gpsPointSampleY"])
+    dmg = _numeric_col(df, ["ros_dano_por_muestra", "calculatedDamagePercentage", "damagePercentage"])
 
-    dmg = pd.to_numeric(df.get("calculatedDamagePercentage"), errors="coerce")
-    dmg = dmg.fillna(pd.to_numeric(df.get("damagePercentage"), errors="coerce"))
-    dmg = dmg.fillna(pd.to_numeric(df.get("ros_dano_por_muestra"), errors="coerce"))
+    nro = _first_series(df, ["NroSiniestro", "NroReferencia_modo", "referenceId", "lossID"])
+    wo = _first_series(df, ["workOrderId", "_key_workorder"])
+    lot_name = _first_series(df, ["ros_lote_nombre", "lotName", "ros_lote__lotName"])
+    muestra = _first_series(df, ["muestraId", "ros_muestra__muestra_index"])
+    cultivo = _first_series(df, ["nova_lote__harvest", "DescCultivo_modo", "CropName"])
 
-    origen = df.get("origen_muestra")
-    mask = (
-        lat.between(-90, 90)
-        & lon.between(-180, 180)
-        & dmg.notna()
-        & (origen.astype(str) != "top_level" if origen is not None else True)
-    )
+    assigned = _parse_claim_date(_first_series(df, ["ros_ot__assignedDate", "fecha_tasacion_nova", "occurDate"]))
+    event = _parse_claim_date(_first_series(df, ["fecha_evento_nova", "occurDate", "fecha_denuncia_nova"]))
+
+    origen = df.get("origen_muestra") if "origen_muestra" in df.columns else None
+    mask = lat.between(-90, 90) & lon.between(-180, 180) & dmg.notna()
+    if origen is not None:
+        mask = mask & (origen.astype(str) != "top_level")
+
     out = pd.DataFrame(
         {
             "lat": lat[mask].astype(float),
             "lon": lon[mask].astype(float),
             "damage": dmg[mask].astype(float).clip(0, 100),
-            "lot_name": (df.get("lotName") if "lotName" in df.columns else pd.Series([""] * len(df)))[mask]
-            .astype(str)
-            .fillna(""),
-            "nro_siniestro": (df.get("NroSiniestro") if "NroSiniestro" in df.columns else pd.Series([""] * len(df)))[
-                mask
-            ]
-            .astype(str)
-            .fillna(""),
-            "muestra_id": (df.get("muestraId") if "muestraId" in df.columns else pd.Series([""] * len(df)))[mask]
-            .astype(str)
-            .fillna(""),
-            "cultivo": (df.get("DescCultivo_modo") if "DescCultivo_modo" in df.columns else pd.Series([""] * len(df)))[
-                mask
-            ]
-            .astype(str)
-            .fillna(""),
+            "lot_name": _as_clean_str(lot_name[mask]),
+            "nro_siniestro": _as_clean_str(nro[mask]),
+            "orden_trabajo": _as_clean_str(wo[mask]),
+            "muestra_id": _as_clean_str(muestra[mask]),
+            "cultivo": _as_clean_str(cultivo[mask]),
+            "fecha_orden": assigned[mask].values,
+            "fecha_evento": event[mask].values,
         }
     )
-    out = out.drop_duplicates(subset=["lat", "lon", "damage", "nro_siniestro"]).reset_index(drop=True)
+    out = out.drop_duplicates(
+        subset=["lat", "lon", "damage", "nro_siniestro", "orden_trabajo", "muestra_id"]
+    ).reset_index(drop=True)
     return out
+
+
+def _first_series(df: pd.DataFrame, names: list[str]) -> pd.Series:
+    for name in names:
+        if name in df.columns:
+            return df[name]
+    return pd.Series([None] * len(df), index=df.index)
+
+
+def _numeric_col(df: pd.DataFrame, names: list[str]) -> pd.Series:
+    for name in names:
+        if name in df.columns:
+            col = pd.to_numeric(df[name], errors="coerce")
+            if not col.isna().all():
+                return col
+    return pd.Series(np.nan, index=df.index, dtype=float)
+
+
+def _as_clean_str(series: pd.Series) -> pd.Series:
+    s = series.map(lambda v: "" if v is None or (isinstance(v, float) and np.isnan(v)) else str(v))
+    return s.str.replace(r"\.0$", "", regex=True).replace({"nan": "", "None": "", "<NA>": ""})
+
+
+def _parse_claim_date(series: pd.Series) -> pd.Series:
+    """Parse mixed claim date strings to datetime64 (NaT on failure)."""
+    raw = series.astype(str).str.strip()
+    # "18/02/202000:00:00" → "18/02/2020 00:00:00"
+    raw = raw.str.replace(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2}:\d{2})", r"\1 \2", regex=True)
+    # "2020-02-1616:00:00" → "2020-02-16 16:00:00"
+    raw = raw.str.replace(r"(\d{4}-\d{2}-\d{2})(\d{2}:\d{2}:\d{2})", r"\1 \2", regex=True)
+    iso = raw.str.match(r"^\d{4}-\d{2}-\d{2}")
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if iso.any():
+        parsed.loc[iso] = pd.to_datetime(raw.loc[iso], errors="coerce")
+    if (~iso).any():
+        parsed.loc[~iso] = pd.to_datetime(raw.loc[~iso], dayfirst=True, errors="coerce")
+    return parsed
+
+
+def prefer_first_work_order(claims: pd.DataFrame, sample_idxs: list[int]) -> list[int]:
+    """
+    Among samples that fall in one lot, keep only those from the first work order.
+    First = earliest fecha_orden / fecha_evento, then lowest orden_trabajo id.
+    """
+    if not sample_idxs:
+        return []
+    sub = claims.iloc[sample_idxs].copy()
+    sub["_orig_idx"] = sample_idxs
+    if "orden_trabajo" not in sub.columns:
+        return sample_idxs
+    sub["orden_trabajo"] = sub["orden_trabajo"].astype(str).replace({"nan": "", "None": ""})
+    sub = sub[sub["orden_trabajo"] != ""]
+    if sub.empty:
+        return sample_idxs
+    if sub["orden_trabajo"].nunique() <= 1:
+        return sub["_orig_idx"].astype(int).tolist()
+
+    wo_rank = (
+        sub.groupby("orden_trabajo", as_index=False)
+        .agg(
+            fecha_orden=("fecha_orden", "min"),
+            fecha_evento=("fecha_evento", "min"),
+        )
+        .sort_values(
+            by=["fecha_orden", "fecha_evento", "orden_trabajo"],
+            ascending=True,
+            na_position="last",
+        )
+    )
+    first_wo = str(wo_rank.iloc[0]["orden_trabajo"])
+    return sub.loc[sub["orden_trabajo"] == first_wo, "_orig_idx"].astype(int).tolist()
 
 
 def _lot_id_from_props(props: dict[str, Any], idx: int) -> str:
@@ -121,7 +193,6 @@ def build_or_load_index(force: bool = False) -> dict[str, Any]:
 
     points = [Point(xy) for xy in zip(claims["lon"].tolist(), claims["lat"].tolist())]
     tree = STRtree(lots.geometry.values)
-    lot_sample_counts: dict[int, int] = {}
     lot_sample_idxs: dict[int, list[int]] = {}
     print("[AGRO] Spatial join samples -> lots...")
     for i, pt in enumerate(points):
@@ -130,8 +201,12 @@ def build_or_load_index(force: bool = False) -> dict[str, Any]:
             li = int(li)
             geom = lots.geometry.iloc[li]
             if geom.contains(pt) or geom.touches(pt):
-                lot_sample_counts[li] = lot_sample_counts.get(li, 0) + 1
                 lot_sample_idxs.setdefault(li, []).append(i)
+
+    # Misma lote + varias OT → quedarse con la primera OT (fecha / id)
+    for li, idxs in list(lot_sample_idxs.items()):
+        lot_sample_idxs[li] = prefer_first_work_order(claims, idxs)
+    lot_sample_counts = {li: len(idxs) for li, idxs in lot_sample_idxs.items()}
 
     keep_idx = [i for i, c in lot_sample_counts.items() if c >= 3]
     keep_idx = sorted(keep_idx, key=lambda i: lot_sample_counts[i], reverse=True)[:200]

@@ -38,21 +38,48 @@ export type SessionState = {
   meta: Record<string, unknown>;
 };
 
+export type ClusterContribution = {
+  cluster: number;
+  label: string;
+  n_cells: number;
+  area_ha: number;
+  weight: number;
+  weight_pct: number;
+  damage: number;
+  contribution: number;
+  contribution_pct: number;
+};
+
 export type CompareResult = {
   traditional_mean: number;
+  weighted_mean: number;
+  weighted_ambientes_mean: number;
   directed_mean: number;
   abs_diff: number;
   pct_diff: number;
+  abs_diff_ambientes?: number;
+  pct_diff_ambientes?: number;
+  abs_diff_k_vs_ambientes?: number;
+  pct_diff_k_vs_ambientes?: number;
+  abs_diff_idw?: number;
+  pct_diff_idw?: number;
   n_samples: number;
   k: number;
+  k_ambientes?: number;
   area_ha: number;
   grid_res_m: number;
+  clusters?: ClusterContribution[];
+  ambientes?: ClusterContribution[];
+  cluster_to_ambiente?: Record<string, number>;
+  ambientes_silhouette?: number | null;
   sample_stats?: Record<string, number>;
   idw_stats?: Record<string, number>;
   idw_png_url?: string;
   zones_png_url?: string;
   samples_url?: string;
   centroids_url?: string;
+  clusters_url?: string;
+  ambientes_url?: string;
   lot_url?: string;
   bounds?: number[];
 };

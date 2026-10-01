@@ -6,15 +6,17 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from app.core.config import settings
 from app.core.sample_rules import min_samples_for_area_ha
-from app.models.schemas import CompareResult, IdwParams, SessionState, ZoneParams
+from app.models.schemas import IdwParams, SessionState, ZoneParams
 from app.services.assign_service import assign_nearest_damage
 from app.services.catalog import catalog
 from app.services.compare_service import compare_methods, summary_stats
 from app.services.geo_utils import (
     area_ha_wgs84,
+    cluster_hulls,
     geom_from_geojson,
     grid_outline_geojson,
     grid_points_in_polygon,
@@ -40,6 +42,122 @@ class SessionStore:
         path = self._dir(session_id) / "state.json"
         with path.open("w", encoding="utf-8") as f:
             json.dump(meta.model_dump() if isinstance(meta, SessionState) else meta, f, indent=2)
+
+    def _persist_arrays(self, session_id: str) -> None:
+        """Write runtime arrays so sessions survive process restarts."""
+        sess = self._mem[session_id]
+        sdir = self._dir(session_id)
+        if sess.get("grid_lons") is not None and sess.get("grid_lats") is not None:
+            np.save(sdir / "grid_lons.npy", sess["grid_lons"])
+            np.save(sdir / "grid_lats.npy", sess["grid_lats"])
+        if sess.get("labels") is not None:
+            np.save(sdir / "labels.npy", sess["labels"])
+        if sess.get("centroid_lons") is not None and sess.get("centroid_lats") is not None:
+            payload: dict[str, np.ndarray] = {
+                "lons": np.asarray(sess["centroid_lons"], dtype=float),
+                "lats": np.asarray(sess["centroid_lats"], dtype=float),
+            }
+            if sess.get("centroid_damages") is not None:
+                payload["damages"] = np.asarray(sess["centroid_damages"], dtype=float)
+            np.savez(sdir / "centroids.npz", **payload)
+
+    def _coords_from_geojson(self, path: Path) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+        with path.open(encoding="utf-8") as f:
+            fc = json.load(f)
+        lons: list[float] = []
+        lats: list[float] = []
+        props: list[dict[str, Any]] = []
+        for feat in fc.get("features", []):
+            geom = feat.get("geometry") or {}
+            if geom.get("type") != "Point":
+                continue
+            coords = geom.get("coordinates") or []
+            if len(coords) < 2:
+                continue
+            lons.append(float(coords[0]))
+            lats.append(float(coords[1]))
+            props.append(feat.get("properties") or {})
+        return np.asarray(lons, dtype=float), np.asarray(lats, dtype=float), props
+
+    def _hydrate(self, session_id: str) -> None:
+        sdir = settings.sessions_dir / session_id
+        state_path = sdir / "state.json"
+        if not state_path.exists():
+            raise KeyError(f"Sesión no encontrada: {session_id}")
+
+        with state_path.open(encoding="utf-8") as f:
+            state = SessionState.model_validate(json.load(f))
+
+        lot_path = sdir / "lot.geojson"
+        if not lot_path.exists():
+            raise KeyError(f"Sesión incompleta (sin lote): {session_id}")
+        with lot_path.open(encoding="utf-8") as f:
+            lot_fc = json.load(f)
+        lot_feat = (lot_fc.get("features") or [None])[0]
+        if not lot_feat or not lot_feat.get("geometry"):
+            raise KeyError(f"Sesión incompleta (geometría inválida): {session_id}")
+        geom = geom_from_geojson(lot_feat["geometry"])
+
+        samples_path = sdir / "samples.parquet"
+        if samples_path.exists():
+            samples = pd.read_parquet(samples_path)
+        else:
+            samples = catalog.samples_for_lot(state.lot_id)
+
+        grid_lons = grid_lats = labels = None
+        centroid_lons = centroid_lats = centroid_damages = None
+        idw_raster = idw_bounds = None
+
+        if (sdir / "grid_lons.npy").exists() and (sdir / "grid_lats.npy").exists():
+            grid_lons = np.load(sdir / "grid_lons.npy")
+            grid_lats = np.load(sdir / "grid_lats.npy")
+        elif (sdir / "grid_labeled.geojson").exists():
+            grid_lons, grid_lats, gprops = self._coords_from_geojson(sdir / "grid_labeled.geojson")
+            if gprops and "cluster" in gprops[0]:
+                labels = np.asarray([int(p.get("cluster", 0)) for p in gprops], dtype=int)
+        elif (sdir / "grid.geojson").exists():
+            grid_lons, grid_lats, _ = self._coords_from_geojson(sdir / "grid.geojson")
+
+        if (sdir / "labels.npy").exists():
+            labels = np.load(sdir / "labels.npy")
+
+        centroids_npz = sdir / "centroids.npz"
+        if centroids_npz.exists():
+            z = np.load(centroids_npz)
+            centroid_lons = z["lons"]
+            centroid_lats = z["lats"]
+            if "damages" in z.files:
+                centroid_damages = z["damages"]
+        else:
+            cpath = sdir / "centroids_damage.geojson"
+            if not cpath.exists():
+                cpath = sdir / "centroids.geojson"
+            if cpath.exists():
+                centroid_lons, centroid_lats, cprops = self._coords_from_geojson(cpath)
+                if cprops and "damage" in cprops[0]:
+                    centroid_damages = np.asarray(
+                        [float(p.get("damage", np.nan)) for p in cprops], dtype=float
+                    )
+
+        if (sdir / "idw.npy").exists():
+            idw_raster = np.load(sdir / "idw.npy")
+            bounds = (state.meta.get("idw") or {}).get("bounds")
+            if bounds:
+                idw_bounds = bounds
+
+        self._mem[session_id] = {
+            "state": state,
+            "geom": geom,
+            "samples": samples,
+            "grid_lons": grid_lons,
+            "grid_lats": grid_lats,
+            "labels": labels,
+            "centroid_lons": centroid_lons,
+            "centroid_lats": centroid_lats,
+            "centroid_damages": centroid_damages,
+            "idw_raster": idw_raster,
+            "idw_bounds": idw_bounds,
+        }
 
     def create(self, lot_id: str, mode: str, grid_res_m: float) -> SessionState:
         feature = catalog.get_lot_feature(lot_id)
@@ -83,6 +201,7 @@ class SessionStore:
                     "damage": float(samples.iloc[i]["damage"]),
                     "lot_name": str(samples.iloc[i].get("lot_name") or ""),
                     "nro_siniestro": str(samples.iloc[i].get("nro_siniestro") or ""),
+                    "orden_trabajo": str(samples.iloc[i].get("orden_trabajo") or ""),
                 }
                 for i in range(len(samples))
             ],
@@ -108,14 +227,14 @@ class SessionStore:
 
     def get(self, session_id: str) -> dict[str, Any]:
         if session_id not in self._mem:
-            raise KeyError(f"Sesión no encontrada: {session_id}")
+            self._hydrate(session_id)
         return self._mem[session_id]
 
     def state(self, session_id: str) -> SessionState:
         return self.get(session_id)["state"]
 
     def artifact_path(self, session_id: str, name: str) -> Path:
-        return self._dir(session_id) / name
+        return settings.sessions_dir / session_id / name
 
     def step_grid(self, session_id: str) -> dict[str, Any]:
         sess = self.get(session_id)
@@ -147,6 +266,7 @@ class SessionStore:
             st.steps_done.append("grid")
         st.status = "grid"
         self._save_meta(session_id)
+        self._persist_arrays(session_id)
         return {
             "n_cells": meta["n_cells"],
             "grid_res_m": res,
@@ -178,6 +298,7 @@ class SessionStore:
             st.steps_done.append("kmeans")
         st.status = "kmeans"
         self._save_meta(session_id)
+        self._persist_arrays(session_id)
         return {
             "k": result["k"],
             "centroids_url": f"/api/sessions/{session_id}/artifacts/centroids.geojson",
@@ -221,6 +342,7 @@ class SessionStore:
             st.steps_done.append("assign")
         st.status = "assign"
         self._save_meta(session_id)
+        self._persist_arrays(session_id)
         return {
             "damage_mean": result["damage_mean"],
             "damage_min": result["damage_min"],
@@ -264,6 +386,7 @@ class SessionStore:
             "power": params.power,
         }
         self._save_meta(session_id)
+        self._persist_arrays(session_id)
         return payload
 
     def step_zones(self, session_id: str, params: ZoneParams) -> dict[str, Any]:
@@ -289,16 +412,35 @@ class SessionStore:
 
     def step_compare(self, session_id: str) -> dict[str, Any]:
         sess = self.get(session_id)
+        if sess["centroid_damages"] is None:
+            self.step_assign(session_id)
         if sess["idw_raster"] is None:
             self.step_idw(session_id, IdwParams())
+        if sess["labels"] is None:
+            self.step_kmeans(session_id)
         st = sess["state"]
-        cmp: CompareResult = compare_methods(
+        cmp, ambiente_labels = compare_methods(
             sess["samples"]["damage"].to_numpy(dtype=float),
             sess["idw_raster"],
+            sess["labels"],
+            sess["centroid_damages"],
             st.k,
             st.area_ha,
             st.grid_res_m,
         )
+        sdir = self._dir(session_id)
+        ambientes_fc = cluster_hulls(sess["grid_lons"], sess["grid_lats"], ambiente_labels)
+        for feat in ambientes_fc.get("features", []):
+            props = feat.setdefault("properties", {})
+            a = int(props.get("cluster", 0))
+            props["ambiente"] = a
+            props["label"] = f"A{a + 1}"
+            if a < len(cmp.ambientes):
+                props["damage"] = cmp.ambientes[a].damage
+                props["area_ha"] = cmp.ambientes[a].area_ha
+                props["weight_pct"] = cmp.ambientes[a].weight_pct
+        with (sdir / "ambientes.geojson").open("w", encoding="utf-8") as f:
+            json.dump(ambientes_fc, f)
         if "compare" not in st.steps_done:
             st.steps_done.append("compare")
         st.status = "compare"
@@ -312,6 +454,8 @@ class SessionStore:
             "zones_png_url": f"/api/sessions/{session_id}/artifacts/zones.png",
             "samples_url": f"/api/sessions/{session_id}/artifacts/samples.geojson",
             "centroids_url": f"/api/sessions/{session_id}/artifacts/centroids_damage.geojson",
+            "clusters_url": f"/api/sessions/{session_id}/artifacts/clusters.geojson",
+            "ambientes_url": f"/api/sessions/{session_id}/artifacts/ambientes.geojson",
             "lot_url": f"/api/sessions/{session_id}/artifacts/lot.geojson",
             "bounds": sess["idw_bounds"],
         }

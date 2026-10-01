@@ -87,11 +87,11 @@ export const DIDACTIC: Record<WizardStep, Didactic> = {
   },
   8: {
     title: 'Comparación metodológica',
-    what: 'Se contrastan el daño promedio tradicional (media de muestras) y el estimado por muestreo dirigido (media del raster IDW).',
-    why: 'Permite cuantificar cuánto cambia la estimación al incorporar estructura espacial.',
-    how: 'Δ absoluta = dirigido − tradicional; Δ% relativa al tradicional. Se acompañan con indicadores y mapa.',
-    uses: 'Muestras reales + raster IDW + metadatos del lote.',
-    result: 'KPIs de comparación y visualización conjunta.',
+    what: 'Se contrastan tres estimaciones: promedio simple de muestras, promedio ponderado por área de los k clusters K-Means, y promedio ponderado tras reducir ambientes fusionando clusters con daño similar (re-KMeans 1D).',
+    why: 'El muestreo dirigido no solo cambia el número de puntos: también permite condensar ambientes homogéneos y ver cómo eso mueve el daño del lote.',
+    how: '1) Media simple. 2) Σ(daño×área)/área con k clusters. 3) K-Means sobre el daño de centroides (silhouette elige k′) → ambientes → nuevo ponderado.',
+    uses: 'Labels K-Means, daño asignado a centroides y grilla operativa.',
+    result: 'Tres KPIs + tablas de clusters y ambientes (área, peso, aporte) y Δ entre métodos.',
     next: 'Listo para uso operativo o revisión didáctica de cualquier paso anterior.',
   },
 };

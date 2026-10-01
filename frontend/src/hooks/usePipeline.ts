@@ -183,7 +183,20 @@ export function usePipelineActions() {
             bounds: data.bounds as [number, number, number, number],
           });
         }
-        setLayers({ lot: true, idw: true, samples: true, centroids: true });
+        try {
+          const [clustersFc, ambientesFc] = await Promise.all([
+            fetchJson(api.artifactUrl(id, 'clusters.geojson')),
+            fetchJson(api.artifactUrl(id, 'ambientes.geojson')),
+          ]);
+          setGeojson('clusters', clustersFc);
+          // Show reduced ambientes on the clusters layer after finalize
+          if (ambientesFc?.features?.length) {
+            setGeojson('clusters', ambientesFc);
+          }
+        } catch {
+          /* optional */
+        }
+        setLayers({ lot: true, clusters: true, samples: true, centroids: true, idw: false });
         await refreshSession(id);
         return data;
       } catch (e) {

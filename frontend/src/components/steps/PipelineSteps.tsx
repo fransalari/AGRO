@@ -227,26 +227,126 @@ export function StepZones() {
 export function StepCompare() {
   const { runCompare } = usePipelineActions();
   const compare = useAppStore((s) => s.compare);
+  const clusters = compare?.clusters ?? [];
+  const ambientes = compare?.ambientes ?? [];
+  const kAmb = compare?.k_ambientes ?? ambientes.length;
 
   return (
     <div className="space-y-3 text-sm">
       <button type="button" className="btn-primary" onClick={() => runCompare()}>
-        Calcular comparación
+        Finalizar
       </button>
       {compare && (
-        <div className="grid grid-cols-2 gap-2">
-          <Kpi title="Tradicional" value={`${compare.traditional_mean.toFixed(2)}%`} hint="Media muestras" />
-          <Kpi title="Dirigido" value={`${compare.directed_mean.toFixed(2)}%`} hint="Media IDW" />
-          <Kpi title="Δ absoluta" value={`${compare.abs_diff.toFixed(2)} pp`} />
-          <Kpi title="Δ porcentual" value={`${compare.pct_diff.toFixed(2)}%`} />
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 gap-2">
+            <Kpi
+              title="1 · Promedio simple"
+              value={`${compare.traditional_mean.toFixed(2)}%`}
+              hint="Media de muestras (sin peso espacial)"
+            />
+            <Kpi
+              title={`2 · Ponderado K-Means (k=${compare.k})`}
+              value={`${compare.weighted_mean.toFixed(2)}%`}
+              hint={`Δ vs simple: ${compare.abs_diff.toFixed(2)} pp (${compare.pct_diff.toFixed(1)}%)`}
+            />
+            <Kpi
+              title={`3 · Ambientes reducidos (k'=${kAmb})`}
+              value={`${(compare.weighted_ambientes_mean ?? 0).toFixed(2)}%`}
+              hint={`Re-KMeans por similitud de daño · Δ vs simple: ${(compare.abs_diff_ambientes ?? 0).toFixed(2)} pp · Δ vs k: ${(compare.abs_diff_k_vs_ambientes ?? 0).toFixed(2)} pp`}
+            />
+          </div>
+
+          <ContributionTable
+            title={`Clusters K-Means (k=${compare.k})`}
+            rows={clusters}
+            footnote="Peso = área del cluster / área total. Aporte = daño × peso."
+          />
+
+          {ambientes.length > 0 && (
+            <ContributionTable
+              title={`Ambientes por similitud (k'=${kAmb}${kAmb < compare.k ? ` · reducido desde ${compare.k}` : ''})`}
+              rows={ambientes}
+              footnote="Se vuelve a hacer K-Means sobre el daño de los centroides y se fusionan clusters similares. El daño del ambiente es el promedio ponderado de sus clusters."
+            />
+          )}
+
           <ResultsBox>
             <p>Muestras: {compare.n_samples}</p>
-            <p>Centroides k: {compare.k}</p>
-            <p>Área: {compare.area_ha.toFixed(1)} ha</p>
+            <p>
+              Clusters → ambientes: {compare.k} → {kAmb}
+            </p>
+            <p>Área lote: {compare.area_ha.toFixed(1)} ha</p>
             <p>Resolución: {compare.grid_res_m} m</p>
+            {compare.ambientes_silhouette != null && (
+              <p>Silhouette ambientes: {compare.ambientes_silhouette.toFixed(3)}</p>
+            )}
+            <p>
+              IDW (ref.): {compare.directed_mean.toFixed(2)}%
+              {compare.abs_diff_idw != null && (
+                <span className="text-emerald-100/50">
+                  {' '}
+                  (Δ {compare.abs_diff_idw.toFixed(2)} pp vs simple)
+                </span>
+              )}
+            </p>
           </ResultsBox>
         </div>
       )}
+    </div>
+  );
+}
+
+function ContributionTable({
+  title,
+  rows,
+  footnote,
+}: {
+  title: string;
+  rows: {
+    cluster: number;
+    label: string;
+    area_ha: number;
+    weight_pct: number;
+    damage: number;
+    contribution: number;
+    contribution_pct: number;
+  }[];
+  footnote: string;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <div className="rounded-xl border border-white/15 overflow-hidden">
+      <div className="bg-black/30 px-3 py-2 text-[11px] uppercase tracking-wider text-lime-200/80">
+        {title}
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-[11px]">
+          <thead className="text-emerald-100/60 border-b border-white/10">
+            <tr>
+              <th className="px-2 py-1.5 font-medium">ID</th>
+              <th className="px-2 py-1.5 font-medium">Área</th>
+              <th className="px-2 py-1.5 font-medium">Peso</th>
+              <th className="px-2 py-1.5 font-medium">Daño</th>
+              <th className="px-2 py-1.5 font-medium">Aporte</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((c) => (
+              <tr key={`${title}-${c.cluster}`} className="border-b border-white/5 last:border-0">
+                <td className="px-2 py-1.5 text-white">{c.label}</td>
+                <td className="px-2 py-1.5">{c.area_ha.toFixed(2)} ha</td>
+                <td className="px-2 py-1.5">{c.weight_pct.toFixed(1)}%</td>
+                <td className="px-2 py-1.5">{c.damage.toFixed(1)}%</td>
+                <td className="px-2 py-1.5">
+                  {c.contribution.toFixed(2)} pp
+                  <span className="text-emerald-100/50"> ({c.contribution_pct.toFixed(0)}%)</span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="px-3 py-2 text-[10px] text-emerald-100/55 border-t border-white/10">{footnote}</p>
     </div>
   );
 }

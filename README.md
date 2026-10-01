@@ -17,7 +17,7 @@ Plataforma web para análisis espacial de daños en lotes agrícolas (Sancor Seg
 Colocar en `data/raw/`:
 
 - `lotes_25-26.geojson`
-- `Siniestros_Completo_Marcos_Juarez.csv`
+- `Siniestros_Completo_Marcos_Juarez.csv` (jerarquía: siniestro → orden de trabajo → lote → muestras; si un lote tiene varias OT, se usa la primera)
 
 Luego generar el índice de lotes con muestras:
 

@@ -1,9 +1,19 @@
 import { useEffect, useRef } from 'react';
-import * as maplibregl from 'maplibre-gl';
-import type { GeoJSONSource, Map as MapLibreMap, StyleSpecification } from 'maplibre-gl';
+import {
+  Map as MapLibreMap,
+  NavigationControl,
+  setWorkerUrl,
+  type GeoJSONSource,
+  type StyleSpecification,
+} from 'maplibre-gl';
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
+import { bbox, centroid } from '@turf/turf';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { useAppStore, type LayerKey } from '../store';
-import type { Feature, FeatureCollection } from 'geojson';
+import type { Feature, FeatureCollection, Geometry } from 'geojson';
+
+// MapLibre v6 + Vite: worker must go through Vite's worker pipeline (?worker&url).
+setWorkerUrl(maplibreWorkerUrl);
 
 const CLUSTER_COLORS = [
   '#4caf50',
@@ -30,6 +40,8 @@ const CLUSTER_COLORS = [
 
 const STYLE: StyleSpecification = {
   version: 8,
+  // Explicit mercator: globe projection can hide flat fills unexpectedly.
+  projection: { type: 'mercator' },
   sources: {
     esri: {
       type: 'raster',
@@ -38,6 +50,7 @@ const STYLE: StyleSpecification = {
       ],
       tileSize: 256,
       attribution: 'Esri, Maxar, Earthstar Geographics',
+      maxzoom: 19,
     },
     labels: {
       type: 'raster',
@@ -46,23 +59,133 @@ const STYLE: StyleSpecification = {
       ],
       tileSize: 256,
       attribution: 'Esri',
+      maxzoom: 19,
     },
   },
   layers: [
+    {
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': '#0b1a12' },
+    },
     { id: 'esri', type: 'raster', source: 'esri' },
     { id: 'labels', type: 'raster', source: 'labels' },
   ],
 };
 
+function cloneGeometry(geometry: Geometry): Geometry {
+  return JSON.parse(JSON.stringify(geometry)) as Geometry;
+}
+
+function lotCollection(feature: Feature): FeatureCollection {
+  // Strip exotic properties / feature.id that can break MapLibre parsing.
+  return {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        properties: { role: 'lot' },
+        geometry: cloneGeometry(feature.geometry as Geometry),
+      },
+    ],
+  };
+}
+
 function ensureSource(map: MapLibreMap, id: string, data: FeatureCollection) {
   const src = map.getSource(id) as GeoJSONSource | undefined;
   if (src) src.setData(data);
-  else map.addSource(id, { type: 'geojson', data });
+  else map.addSource(id, { type: 'geojson', data, tolerance: 0 });
 }
 
 function setVis(map: MapLibreMap, layerId: string, visible: boolean) {
   if (!map.getLayer(layerId)) return;
   map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
+}
+
+function bringToFront(map: MapLibreMap, layerId: string) {
+  if (map.getLayer(layerId)) map.moveLayer(layerId);
+}
+
+function whenStyleReady(map: MapLibreMap, fn: () => void) {
+  let done = false;
+  const run = () => {
+    if (done) return;
+    if (!map.isStyleLoaded()) return;
+    done = true;
+    fn();
+  };
+  if (map.isStyleLoaded()) {
+    run();
+    return;
+  }
+  map.once('load', run);
+}
+
+function boundsFromFeature(feature: Feature): [[number, number], [number, number]] | null {
+  try {
+    const [minX, minY, maxX, maxY] = bbox(feature);
+    if (![minX, minY, maxX, maxY].every(Number.isFinite)) return null;
+    if (minX === maxX || minY === maxY) {
+      const pad = 0.01;
+      return [
+        [minX - pad, minY - pad],
+        [maxX + pad, maxY + pad],
+      ];
+    }
+    return [
+      [minX, minY],
+      [maxX, maxY],
+    ];
+  } catch {
+    return null;
+  }
+}
+
+function ensureLotLayers(map: MapLibreMap) {
+  if (!map.getLayer('lot-fill')) {
+    map.addLayer({
+      id: 'lot-fill',
+      type: 'fill',
+      source: 'lot',
+      paint: {
+        'fill-color': '#ffea00',
+        'fill-opacity': 0.45,
+        'fill-outline-color': '#ff3d00',
+      },
+    });
+  }
+  if (!map.getLayer('lot-outline')) {
+    map.addLayer({
+      id: 'lot-outline',
+      type: 'line',
+      source: 'lot',
+      paint: {
+        'line-color': '#ff3d00',
+        'line-width': 4,
+        'line-opacity': 1,
+      },
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+    });
+  }
+  if (!map.getLayer('lot-centroid')) {
+    map.addLayer({
+      id: 'lot-centroid',
+      type: 'circle',
+      source: 'lot-center',
+      paint: {
+        'circle-radius': 7,
+        'circle-color': '#ff3d00',
+        'circle-stroke-width': 2,
+        'circle-stroke-color': '#ffffff',
+      },
+    });
+  }
+  bringToFront(map, 'lot-fill');
+  bringToFront(map, 'lot-outline');
+  bringToFront(map, 'lot-centroid');
 }
 
 export function MapView() {
@@ -77,16 +200,23 @@ export function MapView() {
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
-    const map = new maplibregl.Map({
+    const map = new MapLibreMap({
       container: containerRef.current,
       style: STYLE,
       center: [-62.3, -33.1],
       zoom: 7,
       attributionControl: {},
+      // Keep 2D mercator for reliable polygon fills over imagery.
     });
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), 'top-right');
+    map.addControl(new NavigationControl({ visualizePitch: false }), 'top-right');
     mapRef.current = map;
+
+    const onResize = () => map.resize();
+    window.addEventListener('resize', onResize);
+    requestAnimationFrame(() => map.resize());
+
     return () => {
+      window.removeEventListener('resize', onResize);
       map.remove();
       mapRef.current = null;
     };
@@ -94,38 +224,48 @@ export function MapView() {
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !lotFeature) return;
-    const fc: FeatureCollection = { type: 'FeatureCollection', features: [lotFeature as Feature] };
-    const apply = () => {
+    if (!map || !lotFeature?.geometry) return;
+
+    const applyLot = () => {
+      map.resize();
+      const fc = lotCollection(lotFeature);
       ensureSource(map, 'lot', fc);
-      if (!map.getLayer('lot-fill')) {
-        map.addLayer({
-          id: 'lot-fill',
-          type: 'fill',
-          source: 'lot',
-          paint: { 'fill-color': '#76ff03', 'fill-opacity': 0.15 },
-        });
-        map.addLayer({
-          id: 'lot-line',
-          type: 'line',
-          source: 'lot',
-          paint: { 'line-color': '#c6ff00', 'line-width': 2.5 },
-        });
-      }
+
+      const centerFt = centroid(lotFeature);
+      ensureSource(map, 'lot-center', {
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            properties: {},
+            geometry: centerFt.geometry,
+          },
+        ],
+      });
+
+      ensureLotLayers(map);
+
+      const show = layers.lot !== false;
+      setVis(map, 'lot-fill', show);
+      setVis(map, 'lot-outline', show);
+      setVis(map, 'lot-centroid', show);
+
+      const fromGeom = boundsFromFeature(lotFeature);
       const b = selectedLot?.bbox;
-      if (b && b.length === 4) {
-        map.fitBounds(
-          [
-            [b[0], b[1]],
-            [b[2], b[3]],
-          ],
-          { padding: 48, duration: 800 },
-        );
+      const bounds =
+        fromGeom ??
+        (b && b.length === 4
+          ? ([[b[0], b[1]], [b[2], b[3]]] as [[number, number], [number, number]])
+          : null);
+
+      if (bounds) {
+        map.fitBounds(bounds, { padding: 64, duration: 700, maxZoom: 16 });
       }
+      map.triggerRepaint();
     };
-    if (map.isStyleLoaded()) apply();
-    else map.once('load', apply);
-  }, [lotFeature, selectedLot]);
+
+    whenStyleReady(map, applyLot);
+  }, [lotFeature, selectedLot, layers.lot]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -279,31 +419,41 @@ export function MapView() {
       };
       if (idwOverlay) setRaster('idw', idwOverlay);
       if (zonesOverlay) setRaster('zones', zonesOverlay);
+
+      // Keep lot vector layers above any overlays that may have been re-added.
+      bringToFront(map, 'lot-fill');
+      bringToFront(map, 'lot-outline');
+      bringToFront(map, 'lot-centroid');
     };
-    if (map.isStyleLoaded()) apply();
-    else map.once('load', apply);
+    whenStyleReady(map, apply);
   }, [geojson, idwOverlay, zonesOverlay]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-    const vis: Record<string, LayerKey> = {
-      'lot-fill': 'lot',
-      'lot-line': 'lot',
-      'grid-line': 'grid',
-      'grid-pts': 'grid',
-      'clusters-fill': 'clusters',
-      'clusters-line': 'clusters',
-      'centroids-circle': 'centroids',
-      'centroids-label': 'centroids',
-      'samples-circle': 'samples',
-      'idw-layer': 'idw',
-      'zones-layer': 'zones',
-    };
-    Object.entries(vis).forEach(([layerId, key]) => {
-      setVis(map, layerId, !!layers[key]);
+    if (!map) return;
+    whenStyleReady(map, () => {
+      const vis: Record<string, LayerKey | 'lot'> = {
+        'lot-fill': 'lot',
+        'lot-outline': 'lot',
+        'lot-centroid': 'lot',
+        'lot-line': 'lot',
+        'grid-line': 'grid',
+        'grid-pts': 'grid',
+        'clusters-fill': 'clusters',
+        'clusters-line': 'clusters',
+        'centroids-circle': 'centroids',
+        'centroids-label': 'centroids',
+        'samples-circle': 'samples',
+        'idw-layer': 'idw',
+        'zones-layer': 'zones',
+      };
+      Object.entries(vis).forEach(([layerId, key]) => {
+        setVis(map, layerId, !!layers[key as LayerKey]);
+      });
     });
-  }, [layers, geojson, idwOverlay, zonesOverlay]);
+  }, [layers, geojson, idwOverlay, zonesOverlay, lotFeature]);
 
-  return <div ref={containerRef} className="h-full w-full rounded-xl overflow-hidden shadow-2xl" />;
+  return (
+    <div ref={containerRef} className="h-full w-full min-h-[360px] rounded-xl overflow-hidden shadow-2xl" />
+  );
 }

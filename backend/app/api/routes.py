@@ -150,6 +150,7 @@ def get_artifact(session_id: str, name: str):
         "centroids.geojson",
         "centroids_damage.geojson",
         "clusters.geojson",
+        "ambientes.geojson",
         "grid_labeled.geojson",
         "idw.png",
         "zones.png",
@@ -160,5 +161,10 @@ def get_artifact(session_id: str, name: str):
     path = sessions.artifact_path(session_id, name)
     if not path.exists():
         raise HTTPException(404, "Artefacto no encontrado")
+    # Ensure session can be hydrated if only artifacts were requested after restart
+    try:
+        sessions.get(session_id)
+    except KeyError:
+        pass
     media = "image/png" if name.endswith(".png") else "application/json"
     return FileResponse(path, media_type=media)
